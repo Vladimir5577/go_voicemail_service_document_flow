@@ -1,0 +1,27 @@
+services:
+  voicemail_service:
+    build:
+      context: .
+      dockerfile: ./docker_env/go/Dockerfile
+    container_name: voicemail_service
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # POLL_AT задаётся в местном времени, а контейнер без этого живёт в UTC —
+      # ночной забор уехал бы на три часа вперёд. Работает благодаря tzdata,
+      # который ставит Dockerfile.
+      - TZ=Europe/Moscow
+    volumes:
+      # Прокидываем текущую папку с бинарником main, базой SQLite и записями
+      - ./:/app
+    # Порт наружу НЕ пробрасываем и в project-net НЕ входим: своей авторизации
+    # у сервиса нет, его закрывает шлюз external_api_service. Единственный, кто
+    # должен до него дотягиваться, — этот шлюз, и только по voicemail-net.
+    networks:
+      - voicemail-net
+
+networks:
+  voicemail-net:
+    name: voicemail-net
+    driver: bridge
