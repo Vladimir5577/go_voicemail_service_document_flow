@@ -31,11 +31,23 @@ type Filter struct {
 	To      time.Time
 }
 
+// messageColumns общий для List и Get, поэтому счётчик прослушиваний
+// приезжает везде, где обращение отдаётся целиком.
+//
+// Подзапросом, а не через LEFT JOIN + GROUP BY: он считается уже после LIMIT,
+// то есть двадцать раз на страницу и каждый — попаданием в
+// idx_message_plays_message. Группировка перемолола бы всю выборку целиком.
 const messageColumns = `
 	id, record_id, mailbox, mailbox_name, caller_number, caller_name,
 	received_at, duration_sec, audio_path, audio_bytes, audio_error,
-	status, admin_comment, updated_by_id, updated_by_name, updated_at,
-	fetched_at, acked_at`
+	status, status_by_id,
+	(SELECT name FROM users WHERE id = messages.status_by_id),
+	status_at,
+	admin_comment, comment_by_id,
+	(SELECT name FROM users WHERE id = messages.comment_by_id),
+	comment_at,
+	fetched_at, acked_at,
+	(SELECT count(*) FROM message_plays WHERE message_id = messages.id)`
 
 // Upsert сохраняет обращение, забранное с АТС.
 //
@@ -140,18 +152,33 @@ func (r *MessageRepository) Get(ctx context.Context, id int64) (*model.Message, 
 
 // Update меняет статус и/или комментарий. nil-поле означает «не трогать»:
 // фронт может прислать только комментарий, не меняя статус, и наоборот.
-func (r *MessageRepository) Update(ctx context.Context, id int64, status, comment *string, byID int64, byName string, at time.Time) error {
-	const query = `
-		UPDATE messages SET
-			status          = COALESCE(?, status),
-			admin_comment   = COALESCE(?, admin_comment),
-			updated_by_id   = ?,
-			updated_by_name = ?,
-			updated_at      = ?
-		WHERE id = ?`
+//
+// SET собирается по факту присланного, а не через COALESCE: подпись должна
+// доставаться тому, кто менял **это** поле. Пришёл один комментарий — колонки
+// статуса не трогаются вовсе, и его прежний автор остаётся на месте.
+//
+// Имя не пишется: оно живёт в users, здесь остаётся только id.
+func (r *MessageRepository) Update(ctx context.Context, id int64, status, comment *string, byID int64, at time.Time) error {
+	var sets []string
+	var args []any
 
-	res, err := r.db.ExecContext(ctx, query,
-		nullFromPtr(status), nullFromPtr(comment), byID, byName, at.Unix(), id)
+	if status != nil {
+		sets = append(sets, "status = ?", "status_by_id = ?", "status_at = ?")
+		args = append(args, *status, byID, at.Unix())
+	}
+	if comment != nil {
+		sets = append(sets, "admin_comment = ?", "comment_by_id = ?", "comment_at = ?")
+		args = append(args, *comment, byID, at.Unix())
+	}
+	if len(sets) == 0 {
+		// Хендлер такое отсекает раньше, но пустой UPDATE всё равно бессмыслен.
+		return nil
+	}
+	args = append(args, id)
+
+	query := "UPDATE messages SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+
+	res, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -194,6 +221,84 @@ func (r *MessageRepository) Mailboxes(ctx context.Context) ([]model.MailboxRef, 
 	}
 
 	return refs, rows.Err()
+}
+
+// EnsureUser заводит пользователя, если его ещё нет.
+//
+// Сначала чтение, и только при промахе запись: у известного человека — а это
+// подавляющее большинство запросов — операция сводится к поиску по первичному
+// ключу, без единой записи на диск. Апсертом было бы короче на строку, но он
+// писал бы на каждый запрос ради имени, которое всё равно не меняется.
+//
+// INSERT OR IGNORE, а не голый INSERT: два запроса от нового человека могут
+// разойтись между проверкой и вставкой, и второй словил бы ошибку по ключу.
+func (r *MessageRepository) EnsureUser(ctx context.Context, id int64, name string, at time.Time) error {
+	var exists int
+	err := r.db.QueryRowContext(ctx, "SELECT 1 FROM users WHERE id = ?", id).Scan(&exists)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	_, err = r.db.ExecContext(ctx,
+		"INSERT OR IGNORE INTO users (id, name, seen_at) VALUES (?, ?, ?)",
+		id, name, at.Unix())
+	return err
+}
+
+// SetUserName обновляет имя. Вызывается только когда фронт явно прислал ФИО:
+// в JWT лежит логин, и первый же PATCH с updatedByName превращает «v.petrov»
+// в человеческое имя — для всех записей сразу, и прошлых, и будущих.
+func (r *MessageRepository) SetUserName(ctx context.Context, id int64, name string) error {
+	_, err := r.db.ExecContext(ctx, "UPDATE users SET name = ? WHERE id = ?", name, id)
+	return err
+}
+
+// AddPlay отмечает, что запись разговора открыли. Имя не дублируется — оно
+// в users, здесь только id.
+func (r *MessageRepository) AddPlay(ctx context.Context, messageID, userID int64, at time.Time) error {
+	const query = `
+		INSERT INTO message_plays (message_id, user_id, played_at)
+		VALUES (?, ?, ?)`
+
+	_, err := r.db.ExecContext(ctx, query, messageID, userID, at.Unix())
+	return err
+}
+
+// Plays отдаёт журнал прослушиваний обращения, свежие сверху.
+//
+// LEFT JOIN, а не INNER: если пользователя в справочнике почему-то нет,
+// прослушивание всё равно должно быть видно — с пустым именем, но с id.
+func (r *MessageRepository) Plays(ctx context.Context, messageID int64) ([]model.Play, error) {
+	const query = `
+		SELECT p.user_id, u.name, p.played_at
+		FROM message_plays p
+		LEFT JOIN users u ON u.id = p.user_id
+		WHERE p.message_id = ?
+		ORDER BY p.played_at DESC, p.id DESC`
+
+	rows, err := r.db.QueryContext(ctx, query, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	plays := make([]model.Play, 0)
+	for rows.Next() {
+		var play model.Play
+		var name sql.NullString
+		var playedAt int64
+		if err := rows.Scan(&play.UserID, &name, &playedAt); err != nil {
+			return nil, err
+		}
+		play.UserName = name.String
+		play.PlayedAt = time.Unix(playedAt, 0).UTC()
+		plays = append(plays, play)
+	}
+
+	return plays, rows.Err()
 }
 
 // LastFetchedAt — время последнего удачного забора. Отдельной таблицы состояния
@@ -250,16 +355,19 @@ func scanMessage(s scanner) (*model.Message, error) {
 	var (
 		receivedAt, fetchedAt       int64
 		audioPath, audioError       sql.NullString
-		adminComment, updatedByName sql.NullString
-		audioBytes, updatedByID     sql.NullInt64
-		updatedAt, ackedAt          sql.NullInt64
+		adminComment                sql.NullString
+		statusByName, commentByName sql.NullString
+		audioBytes, ackedAt         sql.NullInt64
+		statusByID, statusAt        sql.NullInt64
+		commentByID, commentAt      sql.NullInt64
 	)
 
 	err := s.Scan(
 		&m.ID, &m.RecordID, &m.Mailbox, &m.MailboxName, &m.CallerNumber, &m.CallerName,
 		&receivedAt, &m.DurationSec, &audioPath, &audioBytes, &audioError,
-		&m.Status, &adminComment, &updatedByID, &updatedByName, &updatedAt,
-		&fetchedAt, &ackedAt,
+		&m.Status, &statusByID, &statusByName, &statusAt,
+		&adminComment, &commentByID, &commentByName, &commentAt,
+		&fetchedAt, &ackedAt, &m.PlayCount,
 	)
 	if err != nil {
 		return nil, err
@@ -271,10 +379,15 @@ func scanMessage(s scanner) (*model.Message, error) {
 	m.AudioBytes = audioBytes.Int64
 	m.AudioError = audioError.String
 	m.AdminComment = adminComment.String
-	m.UpdatedByID = updatedByID.Int64
-	m.UpdatedByName = updatedByName.String
-	if updatedAt.Valid {
-		m.UpdatedAt = time.Unix(updatedAt.Int64, 0).UTC()
+	m.StatusByID = statusByID.Int64
+	m.StatusByName = statusByName.String
+	m.CommentByID = commentByID.Int64
+	m.CommentByName = commentByName.String
+	if statusAt.Valid {
+		m.StatusAt = time.Unix(statusAt.Int64, 0).UTC()
+	}
+	if commentAt.Valid {
+		m.CommentAt = time.Unix(commentAt.Int64, 0).UTC()
 	}
 	if ackedAt.Valid {
 		m.AckedAt = time.Unix(ackedAt.Int64, 0).UTC()

@@ -35,6 +35,28 @@ sudo chown -R devops:devops ../voicemail_data
 ~/go/bin/goose -dir migrations sqlite3 ../voicemail_data/voicemail.db up
 ```
 
+
+## Dump
+Установит на хост sqlite
+```bash
+sudo apt install sqlite3
+```
+
+Выполнить дамп в файл
+```bash
+sqlite3 ../voicemail_data/voicemail.db "VACUUM INTO '../dump_voicemail_$(date +%d_%m_%Y).db'"
+```
+
+Накатить базу из дампа файла
+Если нет папки за проектом то надо создать
+```bash
+mkdir -p ../voicemail_data
+```
+
+```bash
+sqlite3 ../voicemail_data/voicemail.db ".restore ../dump_voicemail_10_09_2026.db"
+```
+
 ## Синхронизация
 
 Забор с АТС запускается консольной командой того же бинарника.
@@ -186,14 +208,23 @@ GET   /health                  состояние, lastSyncAt, pendingAck
 GET   /mailboxes               справочник ящиков для фильтра
 GET   /messages                page, limit, status, mailbox, dateFrom, dateTo
 GET   /messages/{id}/audio     mp3, поддерживает Range (перемотка в плеере)
+GET   /messages/{id}/plays     журнал прослушиваний: кто открывал и когда
 PATCH /messages/{id}           status и/или adminComment
 ```
 
 Статусы: `new`, `in_progress`, `spam`, `done`.
 
-`PATCH` требует `X-User-Id` — без него 400, а не «аноним». `id` берётся только из
-заголовка от шлюза; `updatedByName` в теле — косметика для показа, подделка не
-опасна, потому что настоящая личность в `updated_by_id`.
+`PATCH` и `/audio` требуют `X-User-Id` — без него 400, а не «аноним». `id` берётся
+только из заголовка от шлюза; `updatedByName` в теле — имя для показа, оно ложится
+в справочник `users`, а настоящая личность всегда в id.
+
+Авторство статуса и комментария раздельное: `status_by_id`/`status_at` и
+`comment_by_id`/`comment_at`. Одно поле на двоих приписывало статус тому, кто
+правил только комментарий. Истории изменений нет, хранится текущее состояние.
+
+Обращение к `/audio` пишет строку в журнал прослушиваний. Поэтому у неё
+`Cache-Control: no-store`: с кэшем повторные открытия не доезжали бы до сервиса.
+Запросы с `Range` не считаются — это догрузка хвоста, а не новое прослушивание.
 
 ## Порядок переключения
 

@@ -35,6 +35,7 @@ func setupRouter(h *handler.MessageHandler) *chi.Mux {
 		r.Get("/mailboxes", h.Mailboxes())
 		r.Get("/messages", h.List())
 		r.Get("/messages/{id}/audio", h.Audio())
+		r.Get("/messages/{id}/plays", h.Plays())
 		r.Patch("/messages/{id}", h.Patch())
 	})
 

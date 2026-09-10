@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -23,14 +24,23 @@ func newTestRepo(t *testing.T) *MessageRepository {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	schema, err := os.ReadFile("../../migrations/00001_init_voicemail_schema.sql")
+	// Все миграции по порядку имён — так же, как их катит goose.
+	files, err := filepath.Glob("../../migrations/*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Берём только секцию Up — goose-аннотации SQLite не понимает.
-	up, _, _ := strings.Cut(string(schema), "-- +goose Down")
-	if _, err := db.Exec(strings.TrimPrefix(up, "-- +goose Up")); err != nil {
-		t.Fatal(err)
+	sort.Strings(files)
+
+	for _, file := range files {
+		schema, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Берём только секцию Up — goose-аннотации SQLite не понимает.
+		up, _, _ := strings.Cut(string(schema), "-- +goose Down")
+		if _, err := db.Exec(strings.TrimPrefix(up, "-- +goose Up")); err != nil {
+			t.Fatalf("%s: %v", filepath.Base(file), err)
+		}
 	}
 
 	return NewMessageRepository(db)
@@ -70,7 +80,10 @@ func TestUpsertIsIdempotentAndKeepsAdminFields(t *testing.T) {
 
 	status := model.StatusSpam
 	comment := "перезвонил, реклама"
-	if err := repo.Update(ctx, messages[0].ID, &status, &comment, 5, "Петров В.А.", time.Now()); err != nil {
+	if err := repo.EnsureUser(ctx, 5, "Петров В.А.", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Update(ctx, messages[0].ID, &status, &comment, 5, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,5 +157,197 @@ func TestMarkAckedOnlyListedRecords(t *testing.T) {
 	}
 	if pending != 1 {
 		t.Errorf("неподтверждённых %d, ожидалась 1", pending)
+	}
+}
+
+// Справочник: первый приход заводит человека, повторные ничего не трогают,
+// а явно присланное ФИО заменяет логин разом во всех прошлых записях.
+func TestEnsureUserInsertsOnceAndNameFlowsIntoJoins(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	at := time.Unix(1787591200, 0).UTC()
+	if err := repo.EnsureUser(ctx, 77, "v.petrov", at); err != nil {
+		t.Fatal(err)
+	}
+	// Второй приход того же человека: имя и seen_at должны остаться прежними.
+	if err := repo.EnsureUser(ctx, 77, "кто-то другой", at.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repo.Upsert(ctx, sample("1787591171-00000002", "2026/08/090-1.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	messages, _, err := repo.List(ctx, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := messages[0].ID
+
+	if err := repo.AddPlay(ctx, id, 77, at); err != nil {
+		t.Fatal(err)
+	}
+
+	plays, err := repo.Plays(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plays) != 1 || plays[0].UserName != "v.petrov" {
+		t.Fatalf("повторный EnsureUser затёр имя: %+v", plays)
+	}
+
+	// Фронт прислал ФИО — оно должно подхватиться и в журнале за прошлое,
+	// и в списке обращений.
+	if err := repo.SetUserName(ctx, 77, "Петров Владимир Алексеевич"); err != nil {
+		t.Fatal(err)
+	}
+	status := model.StatusDone
+	if err := repo.Update(ctx, id, &status, nil, 77, at); err != nil {
+		t.Fatal(err)
+	}
+
+	plays, err = repo.Plays(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plays[0].UserName != "Петров Владимир Алексеевич" {
+		t.Errorf("в журнале имя = %q, ожидалось ФИО", plays[0].UserName)
+	}
+
+	messages, _, err = repo.List(ctx, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messages[0].StatusByName != "Петров Владимир Алексеевич" {
+		t.Errorf("в списке status_by_name = %q, join не сработал", messages[0].StatusByName)
+	}
+}
+
+// Правка комментария не должна переписывать авторство статуса — ровно тот
+// случай, из-за которого поля и разделили: Иванов поставил статус, Петров
+// через три дня дописал комментарий.
+func TestUpdateKeepsStatusAuthorWhenOnlyCommentChanges(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	if err := repo.Upsert(ctx, sample("1787591171-00000002", "2026/08/090-1.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	messages, _, err := repo.List(ctx, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := messages[0].ID
+
+	ivanov, petrov := int64(11), int64(22)
+	at := time.Unix(1787591200, 0).UTC()
+	if err := repo.EnsureUser(ctx, ivanov, "Иванов", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureUser(ctx, petrov, "Петров", at); err != nil {
+		t.Fatal(err)
+	}
+
+	status := model.StatusInProgress
+	if err := repo.Update(ctx, id, &status, nil, ivanov, at); err != nil {
+		t.Fatal(err)
+	}
+
+	// Три дня спустя другой человек трогает только комментарий.
+	later := at.Add(72 * time.Hour)
+	comment := "перезвонил, вопрос решён"
+	if err := repo.Update(ctx, id, nil, &comment, petrov, later); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := repo.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if m.StatusByID != ivanov {
+		t.Errorf("статус приписан %d, а ставил его Иванов (%d)", m.StatusByID, ivanov)
+	}
+	if m.StatusByName != "Иванов" {
+		t.Errorf("имя автора статуса = %q", m.StatusByName)
+	}
+	if !m.StatusAt.Equal(at) {
+		t.Errorf("время статуса = %v, ожидалось %v", m.StatusAt, at)
+	}
+	if m.CommentByID != petrov {
+		t.Errorf("комментарий приписан %d, а писал его Петров (%d)", m.CommentByID, petrov)
+	}
+	if !m.CommentAt.Equal(later) {
+		t.Errorf("время комментария = %v, ожидалось %v", m.CommentAt, later)
+	}
+	if m.Status != model.StatusInProgress {
+		t.Errorf("статус = %q, правка комментария его сдвинула", m.Status)
+	}
+}
+
+// Журнал прослушиваний должен отвечать сразу на оба вопроса: сколько раз
+// (число строк) и кто именно — имя приезжает join-ом из справочника.
+func TestPlaysCountsEveryOpenAndKeepsNames(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	if err := repo.Upsert(ctx, sample("1787591171-00000002", "2026/08/090-1.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	messages, _, err := repo.List(ctx, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := messages[0].ID
+
+	at := time.Unix(1787591200, 0).UTC()
+	if err := repo.EnsureUser(ctx, 77, "Петров Владимир Алексеевич", at); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.EnsureUser(ctx, 92, "Иванова Анна Сергеевна", at); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repo.AddPlay(ctx, id, 77, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AddPlay(ctx, id, 92, at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// Тот же человек второй раз — это отдельная строка, а не апсерт.
+	if err := repo.AddPlay(ctx, id, 77, at.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	plays, err := repo.Plays(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plays) != 3 {
+		t.Fatalf("прослушиваний %d, ожидалось 3", len(plays))
+	}
+	if plays[0].UserID != 77 || plays[0].PlayedAt != at.Add(2*time.Minute) {
+		t.Errorf("сверху должно быть свежее, получено %+v", plays[0])
+	}
+	if plays[1].UserName != "Иванова Анна Сергеевна" {
+		t.Errorf("имя не сохранилось: %q", plays[1].UserName)
+	}
+
+	// Тот же счётчик приезжает числом в списке — фронту хватает его, без журнала.
+	listed, _, err := repo.List(ctx, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listed[0].PlayCount != 3 {
+		t.Errorf("play_count в списке = %d, ожидалось 3", listed[0].PlayCount)
+	}
+
+	// Чужое обращение не должно видеть этот журнал.
+	other, err := repo.Plays(ctx, id+1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 0 {
+		t.Errorf("у постороннего обращения %d прослушиваний, ожидалось 0", len(other))
 	}
 }

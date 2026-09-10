@@ -70,14 +70,17 @@ func Load() *Config {
 
 // OpenDB открывает SQLite и приводит его в рабочее состояние.
 //
-// Три прагмы, каждая по своей причине:
+// Четыре прагмы, каждая по своей причине:
 //   - WAL: читатели не блокируют писателя, и файл переживает падение процесса;
 //   - busy_timeout: консольная команда ./main -sync — отдельный процесс, и он
 //     может писать одновременно с сервисом; MaxOpenConns тут не помогает;
 //   - synchronous(FULL): коммит фиксируется на диск до возврата. Обычный для WAL
 //     NORMAL допускает потерю последних коммитов при отключении питания, а мы
 //     сразу после коммита подтверждаем запись на АТС — она уйдёт из INBOX, и
-//     потерянную строку взять будет неоткуда.
+//     потерянную строку взять будет неоткуда;
+//   - foreign_keys: в SQLite внешние ключи по умолчанию выключены, и REFERENCES
+//     остаётся комментарием. Без неё ON DELETE CASCADE у message_plays не
+//     сработает, и удалённое обращение оставит за собой журнал прослушиваний.
 func OpenDB(path string) (*sql.DB, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -88,7 +91,8 @@ func OpenDB(path string) (*sql.DB, error) {
 	dsn := "file:" + path +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=synchronous(FULL)"
+		"&_pragma=synchronous(FULL)" +
+		"&_pragma=foreign_keys(1)"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

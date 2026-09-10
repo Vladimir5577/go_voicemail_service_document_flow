@@ -38,9 +38,19 @@ type Message struct {
 	Status       string
 	AdminComment string
 
-	UpdatedByID   int64
-	UpdatedByName string
-	UpdatedAt     time.Time
+	// PlayCount — сколько раз открывали запись. Считается на лету из message_plays,
+	// своей колонки в messages нет: счётчик и журнал не должны расходиться.
+	PlayCount int
+
+	// Авторство раздельное: одно поле на двоих приписывало статус тому, кто на
+	// самом деле правил только комментарий. Имена подтягиваются из users.
+	StatusByID    int64
+	StatusByName  string
+	StatusAt      time.Time
+
+	CommentByID   int64
+	CommentByName string
+	CommentAt     time.Time
 
 	FetchedAt time.Time
 	AckedAt   time.Time
@@ -48,6 +58,17 @@ type Message struct {
 
 func (m *Message) HasAudio() bool {
 	return m.AudioPath != ""
+}
+
+// Play — отметка о том, что кто-то открыл запись разговора.
+//
+// UserName в таблице не хранится: он приезжает join-ом из users. В строке лежит
+// только UserID — при сотнях тысяч прослушиваний в год дублировать имя в каждой
+// накладно, а меняться оно не должно.
+type Play struct {
+	UserID   int64
+	UserName string
+	PlayedAt time.Time
 }
 
 // MailboxRef — строка справочника ящиков, собранного из самих обращений.

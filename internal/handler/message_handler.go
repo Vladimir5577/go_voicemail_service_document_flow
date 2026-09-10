@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,15 +43,23 @@ type messageResponse struct {
 	DurationSec  int      `json:"durationSec"`
 	HasAudio     bool     `json:"hasAudio"`
 	AudioError   string   `json:"audioError,omitempty"`
+	PlayCount    int      `json:"playCount"`
 	Status       string   `json:"status"`
+	StatusBy     *userRef `json:"statusBy"`
+	StatusAt     *string  `json:"statusAt"`
 	AdminComment *string  `json:"adminComment"`
-	UpdatedBy    *userRef `json:"updatedBy"`
-	UpdatedAt    *string  `json:"updatedAt"`
+	CommentBy    *userRef `json:"commentBy"`
+	CommentAt    *string  `json:"commentAt"`
 }
 
 type userRef struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
+}
+
+type playResponse struct {
+	User     userRef `json:"user"`
+	PlayedAt string  `json:"playedAt"`
 }
 
 func present(m *model.Message) messageResponse {
@@ -65,18 +74,26 @@ func present(m *model.Message) messageResponse {
 		DurationSec:  m.DurationSec,
 		HasAudio:     m.HasAudio(),
 		AudioError:   m.AudioError,
+		PlayCount:    m.PlayCount,
 		Status:       m.Status,
 	}
 
 	if m.AdminComment != "" {
 		out.AdminComment = &m.AdminComment
 	}
-	if m.UpdatedByID != 0 {
-		out.UpdatedBy = &userRef{ID: m.UpdatedByID, Name: m.UpdatedByName}
+	if m.StatusByID != 0 {
+		out.StatusBy = &userRef{ID: m.StatusByID, Name: m.StatusByName}
 	}
-	if !m.UpdatedAt.IsZero() {
-		formatted := m.UpdatedAt.Format(time.RFC3339)
-		out.UpdatedAt = &formatted
+	if !m.StatusAt.IsZero() {
+		formatted := m.StatusAt.Format(time.RFC3339)
+		out.StatusAt = &formatted
+	}
+	if m.CommentByID != 0 {
+		out.CommentBy = &userRef{ID: m.CommentByID, Name: m.CommentByName}
+	}
+	if !m.CommentAt.IsZero() {
+		formatted := m.CommentAt.Format(time.RFC3339)
+		out.CommentAt = &formatted
 	}
 
 	return out
@@ -128,9 +145,87 @@ func (h *MessageHandler) Audio() http.HandlerFunc {
 			return
 		}
 
-		w.Header().Set("Cache-Control", "private, max-age=3600")
+		userID, ok := h.requestUser(r)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "Не передан идентификатор пользователя")
+			return
+		}
+
+		// Range-запросы не считаем: одно прослушивание в потоковом плеере — это
+		// пачка догрузок хвоста, и счётчик показывал бы их, а не людей. Открытие
+		// записи — это всегда первый запрос, без Range.
+		if r.Header.Get("Range") == "" {
+			// Журнал не должен мешать работе: не записалась отметка — человек всё
+			// равно слушает обращение. Аудио тут продукт, учёт — бухгалтерия.
+			if err := h.repo.AddPlay(r.Context(), message.ID, userID, time.Now().UTC()); err != nil {
+				slog.Error("Не удалось записать отметку о прослушивании",
+					"message_id", message.ID, "user_id", userID, "error", err)
+			}
+		}
+
+		// no-store, а не max-age: с кэшем повторное открытие в пределах часа не
+		// дошло бы до сервиса, и журнал молча пропускал бы половину прослушиваний.
+		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, path)
 	}
+}
+
+// Plays отдаёт журнал прослушиваний одного обращения: кто открывал запись и когда.
+// total — это и есть «сколько раз».
+func (h *MessageHandler) Plays() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		message, ok := h.load(w, r)
+		if !ok {
+			return
+		}
+
+		plays, err := h.repo.Plays(r.Context(), message.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Не удалось получить журнал прослушиваний")
+			return
+		}
+
+		items := make([]playResponse, 0, len(plays))
+		for _, play := range plays {
+			items = append(items, playResponse{
+				User:     userRef{ID: play.UserID, Name: play.UserName},
+				PlayedAt: play.PlayedAt.Format(time.RFC3339),
+			})
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items": items,
+			"total": len(items),
+		})
+	}
+}
+
+// requestUser достаёт личность из заголовков шлюза и заводит человека
+// в справочнике, если тот пришёл впервые.
+//
+// Заголовки ставит только шлюз, разобрав JWT, а одноимённые от клиента затирает.
+// Значит отсутствие X-User-Id означает, что запрос пришёл мимо шлюза, — это
+// отказ, а не «аноним».
+//
+// Промах справочника не должен ломать запрос: не завёлся пользователь — человек
+// всё равно слушает запись, а в журнале останется id без имени.
+func (h *MessageHandler) requestUser(r *http.Request) (int64, bool) {
+	userID, err := strconv.ParseInt(r.Header.Get("X-User-Id"), 10, 64)
+	if err != nil || userID <= 0 {
+		return 0, false
+	}
+
+	name := strings.TrimSpace(r.Header.Get("X-User-Name"))
+	if len(name) > maxNameLen {
+		name = name[:maxNameLen]
+	}
+
+	if err := h.repo.EnsureUser(r.Context(), userID, name, time.Now().UTC()); err != nil {
+		slog.Error("Не удалось завести пользователя в справочнике",
+			"user_id", userID, "error", err)
+	}
+
+	return userID, true
 }
 
 type patchRequest struct {
@@ -151,10 +246,8 @@ func (h *MessageHandler) Patch() http.HandlerFunc {
 			return
 		}
 
-		userID, err := strconv.ParseInt(r.Header.Get("X-User-Id"), 10, 64)
-		if err != nil || userID <= 0 {
-			// Заголовкам доверяем только потому, что сеть закрыта. Если их нет,
-			// запрос пришёл не оттуда, откуда мы думаем, — не «аноним», а отказ.
+		userID, ok := h.requestUser(r)
+		if !ok {
 			writeError(w, http.StatusBadRequest, "Не передан идентификатор пользователя")
 			return
 		}
@@ -175,17 +268,22 @@ func (h *MessageHandler) Patch() http.HandlerFunc {
 			return
 		}
 
-		name := strings.TrimSpace(r.Header.Get("X-User-Name"))
+		// В JWT лежит логин, а ФИО знает только фронт. Прислал — записываем его
+		// в справочник: тогда «v.petrov» превращается в человека разом везде,
+		// и в списке обращений, и в журналах прослушиваний за прошлые дни.
 		if body.UpdatedByName != nil {
 			if trimmed := strings.TrimSpace(*body.UpdatedByName); trimmed != "" {
-				name = trimmed
+				if len(trimmed) > maxNameLen {
+					trimmed = trimmed[:maxNameLen]
+				}
+				if err := h.repo.SetUserName(r.Context(), userID, trimmed); err != nil {
+					slog.Error("Не удалось обновить имя пользователя",
+						"user_id", userID, "error", err)
+				}
 			}
 		}
-		if len(name) > maxNameLen {
-			name = name[:maxNameLen]
-		}
 
-		err = h.repo.Update(r.Context(), message.ID, body.Status, body.AdminComment, userID, name, time.Now().UTC())
+		err := h.repo.Update(r.Context(), message.ID, body.Status, body.AdminComment, userID, time.Now().UTC())
 		if errors.Is(err, repository.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "Обращение не найдено")
 			return

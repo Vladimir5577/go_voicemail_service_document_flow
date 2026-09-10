@@ -16,6 +16,13 @@ import (
 // потолок в 1000 обращений на ящик за прогон.
 const maxDrainIterations = 50
 
+// ackOnlyMailbox — ящик «Нерабочее время». Снежана сказала его удалить,
+// поэтому мы его себе не забираем: обращения только подтверждаем на АТС, чтобы
+// INBOX не рос и лампа на телефоне гасла, а в базу они не попадают.
+//
+// ponytail: один ящик хардкодом; список в конфиге — если появится второй.
+const ackOnlyMailbox = "090"
+
 type SyncService struct {
 	client   *vmapi.Client
 	repo     *repository.MessageRepository
@@ -106,6 +113,12 @@ func (s *SyncService) drainMailbox(ctx context.Context, mb vmapi.Mailbox, ack bo
 				continue
 			}
 			seen[msg.ID] = true
+
+			// «Нерабочее время» не сохраняем — сразу в список на подтверждение.
+			if mb.Mailbox == ackOnlyMailbox {
+				complete = append(complete, msg.ID)
+				continue
+			}
 
 			saved, err := s.saveOne(ctx, mb, msg)
 			switch {
