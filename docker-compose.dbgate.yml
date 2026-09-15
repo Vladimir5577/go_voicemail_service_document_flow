@@ -1,0 +1,27 @@
+services:
+
+  voicemail_dbgate:
+    container_name: voicemail_dbgate
+    # НЕ alpine, в отличие от dbgate канбана и уведомлений: SQLite в dbgate —
+    # нативный better-sqlite3 под glibc, на musl он падает с
+    # "fcntl64: symbol not found". Там плагин postgres на чистом JS, потому
+    # alpine и живёт. Здесь нужна glibc-сборка, она втрое толще (880 МБ).
+    image: dbgate/dbgate:5.5.6
+    restart: always
+    ports:
+      # Используем 8090 порт, так как 8089 занят dbgate уведомлений.
+      # Слушаем только localhost: в базе журнал звонков граждан, ей незачем
+      # светиться в сеть — у dbgate своей авторизации нет.
+      - 127.0.0.1:8090:3000
+    # Монтируем каталог, а не файл: рядом с базой SQLite держит -wal и -journal.
+    # Каталог лежит соседом к проекту, внутрь его положить нельзя — снёс бы git clean.
+    volumes:
+      - ./../voicemail_data:/data/sqlite
+    environment:
+      CONNECTIONS: con1
+
+      LABEL_con1: Voicemail SQLite
+      # База — файл, а не сервер: ни SERVER, ни PORT, ни пароля здесь нет.
+      # По той же причине не нужна и сеть voicemail-net: подключаться не к чему.
+      FILE_con1: /data/sqlite/voicemail.db
+      ENGINE_con1: sqlite@dbgate-plugin-sqlite

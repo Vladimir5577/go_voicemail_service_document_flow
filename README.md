@@ -243,3 +243,15 @@ PATCH /messages/{id}           status и/или adminComment
 История смены статусов, уведомления, ретеншн аудио (храним вечно, ~2 ГБ в год),
 поиск по номеру звонившего, счётчики по статусам, `GET /messages/{id}`.
 Добавляется по мере надобности, каждое — небольшая правка.
+
+
+## DdGate
+
+# поднять
+docker compose -f docker-compose.dbgate.yml up -d
+
+# погасить
+docker compose -f docker-compose.dbgate.yml down
+
+# логи, если что-то не так
+docker compose -f docker-compose.dbgate.yml logs -f

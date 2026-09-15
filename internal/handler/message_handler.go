@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -200,12 +201,19 @@ func (h *MessageHandler) Plays() http.HandlerFunc {
 	}
 }
 
-// requestUser достаёт личность из заголовков шлюза и заводит человека
-// в справочнике, если тот пришёл впервые.
+// requestUser достаёт личность из заголовков и заводит человека в справочнике,
+// если тот пришёл впервые.
 //
-// Заголовки ставит только шлюз, разобрав JWT, а одноимённые от клиента затирает.
-// Значит отсутствие X-User-Id означает, что запрос пришёл мимо шлюза, — это
-// отказ, а не «аноним».
+// Заголовки тут двух разных пород, и доверие к ним разное.
+//
+// X-User-Id и X-User-Name ставит шлюз, разобрав JWT, а одноимённые от клиента
+// затирает. Поэтому отсутствие X-User-Id означает, что запрос пришёл мимо
+// шлюза, — это отказ, а не «аноним».
+//
+// X-User-Display-Name, наоборот, ставит сам фронт, и шлюз его не трогает: ФИО
+// в токене нет, знает его только клиент. Подделать такое имя можно — но это
+// косметика, а кто человек на самом деле, видно по user_id, который приехал
+// подписанным каналом. Подпись под статусом и в журнале строится по id.
 //
 // Промах справочника не должен ломать запрос: не завёлся пользователь — человек
 // всё равно слушает запись, а в журнале останется id без имени.
@@ -215,9 +223,18 @@ func (h *MessageHandler) requestUser(r *http.Request) (int64, bool) {
 		return 0, false
 	}
 
-	name := strings.TrimSpace(r.Header.Get("X-User-Name"))
-	if len(name) > maxNameLen {
-		name = name[:maxNameLen]
+	// У PATCH имя приезжает в теле, но у GET за записью тела нет — поэтому
+	// заголовком. Процентами, потому что в HTTP-заголовок кириллицу не положить:
+	// fetch падает с TypeError на первой же «Житнушкиной».
+	//
+	// Логин остаётся запасным вариантом: запрос мимо фронта — курлом, из
+	// Postman — заголовка не принесёт, и человек всё равно должен завестись.
+	name := displayName(r)
+	if name == "" {
+		name = strings.TrimSpace(r.Header.Get("X-User-Name"))
+		if len(name) > maxNameLen {
+			name = name[:maxNameLen]
+		}
 	}
 
 	if err := h.repo.EnsureUser(r.Context(), userID, name, time.Now().UTC()); err != nil {
@@ -226,6 +243,28 @@ func (h *MessageHandler) requestUser(r *http.Request) (int64, bool) {
 	}
 
 	return userID, true
+}
+
+// displayName достаёт ФИО из заголовка фронта. Пустая строка — заголовка нет
+// или он битый: имя косметика, из-за него запрос заваливать нечего.
+func displayName(r *http.Request) string {
+	raw := r.Header.Get("X-User-Display-Name")
+	if raw == "" {
+		return ""
+	}
+
+	decoded, err := url.PathUnescape(raw)
+	if err != nil {
+		slog.Warn("Не удалось раскодировать X-User-Display-Name", "value", raw)
+		return ""
+	}
+
+	decoded = strings.TrimSpace(decoded)
+	if len(decoded) > maxNameLen {
+		decoded = decoded[:maxNameLen]
+	}
+
+	return decoded
 }
 
 type patchRequest struct {
