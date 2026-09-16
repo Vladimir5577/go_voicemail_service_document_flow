@@ -351,3 +351,51 @@ func TestPlaysCountsEveryOpenAndKeepsNames(t *testing.T) {
 		t.Errorf("у постороннего обращения %d прослушиваний, ожидалось 0", len(other))
 	}
 }
+
+// Справочник ящиков — единственное место, где название отдела живёт отдельно от
+// обращения, и единственный его источник — снапшоты в самих обращениях. Отдел
+// переименовали — в фильтре должно оказаться новое имя. Прежний max(mailbox_name)
+// брал лексикографически большее, то есть на этих данных залип бы на старом.
+func TestMailboxesCountsPerBoxAndTakesFreshestName(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	inBox := func(mailbox, name, recordID string) *model.Message {
+		m := sample(recordID, "2026/08/"+mailbox+"-"+recordID+".mp3")
+		m.Mailbox = mailbox
+		m.MailboxName = name
+		return m
+	}
+
+	// record_id начинается с epoch, поэтому свежее обращение всегда больше строкой.
+	for _, m := range []*model.Message{
+		inBox("090", "Нерабочее время", "1787591171-00000002"),
+		inBox("090", "Нерабочее время", "1787591172-00000003"),
+		inBox("090", "Дежурный администратор", "1787591173-00000004"), // отдел переименовали
+		inBox("051", "Договорной отдел", "1787591174-00000005"),
+	} {
+		if err := repo.Upsert(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	refs, err := repo.Mailboxes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("ящиков %d, ожидалось 2", len(refs))
+	}
+	if refs[0].Mailbox != "051" || refs[1].Mailbox != "090" {
+		t.Fatalf("ящики идут %q, %q — ожидался порядок по номеру", refs[0].Mailbox, refs[1].Mailbox)
+	}
+	if refs[0].Total != 1 || refs[1].Total != 3 {
+		t.Errorf("счётчики: 051 = %d (ждали 1), 090 = %d (ждали 3)", refs[0].Total, refs[1].Total)
+	}
+	if refs[1].Name != "Дежурный администратор" {
+		t.Errorf("имя ящика 090 = %q, ожидалось имя из последнего обращения", refs[1].Name)
+	}
+	if refs[0].Name != "Договорной отдел" {
+		t.Errorf("имя ящика 051 = %q", refs[0].Name)
+	}
+}
