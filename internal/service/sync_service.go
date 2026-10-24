@@ -2,7 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -48,6 +51,7 @@ type Stats struct {
 // пока портал ещё читает живой INBOX.
 func (s *SyncService) Run(ctx context.Context, onlyMailbox string, ack bool) (Stats, error) {
 	var total Stats
+	var mailboxErrors []error
 
 	mailboxes, err := s.client.Mailboxes(ctx)
 	if err != nil {
@@ -71,6 +75,7 @@ func (s *SyncService) Run(ctx context.Context, onlyMailbox string, ack bool) (St
 		total.Failed += stats.Failed
 
 		if err != nil {
+			mailboxErrors = append(mailboxErrors, fmt.Errorf("ящик %s: %w", mb.Mailbox, err))
 			// Упавший ящик не должен останавливать остальные: то, что не
 			// подтверждено, приедет следующей ночью.
 			slog.Error("Ящик обработан не полностью",
@@ -82,7 +87,7 @@ func (s *SyncService) Run(ctx context.Context, onlyMailbox string, ack bool) (St
 		"saved", total.Saved, "acked", total.Acked,
 		"skipped", total.Skipped, "failed", total.Failed)
 
-	return total, nil
+	return total, errors.Join(mailboxErrors...)
 }
 
 func (s *SyncService) drainMailbox(ctx context.Context, mb vmapi.Mailbox, ack bool) (Stats, error) {
@@ -218,13 +223,26 @@ func (s *SyncService) saveOne(ctx context.Context, mb vmapi.Mailbox, msg vmapi.M
 }
 
 func (s *SyncService) fetchAudio(ctx context.Context, mailbox, recordID, relPath string) (int64, error) {
+	path := filepath.Join(s.audioDir, relPath)
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.Mode().IsRegular() {
+			return 0, fmt.Errorf("аудиозапись не является обычным файлом: %s", path)
+		}
+		if info.Size() > 0 {
+			return info.Size(), nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, err
+	}
+
 	body, err := s.client.Audio(ctx, mailbox, recordID)
 	if err != nil {
 		return 0, err
 	}
 	defer body.Close()
 
-	return writeFileAtomic(filepath.Join(s.audioDir, relPath), body)
+	return writeFileAtomic(path, body)
 }
 
 func (s *SyncService) ackBatch(ctx context.Context, mailbox string, recordIDs []string) (int, error) {

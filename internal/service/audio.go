@@ -68,6 +68,9 @@ func writeFileAtomic(path string, src io.Reader) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if written == 0 {
+		return 0, fmt.Errorf("получена пустая аудиозапись")
+	}
 
 	if err := tmp.Sync(); err != nil {
 		return 0, err

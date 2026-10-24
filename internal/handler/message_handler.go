@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -25,12 +26,13 @@ const (
 )
 
 type MessageHandler struct {
-	repo     *repository.MessageRepository
-	audioDir string
+	repo            *repository.MessageRepository
+	audioDir        string
+	companyLocation *time.Location
 }
 
-func NewMessageHandler(repo *repository.MessageRepository, audioDir string) *MessageHandler {
-	return &MessageHandler{repo: repo, audioDir: audioDir}
+func NewMessageHandler(repo *repository.MessageRepository, audioDir string, companyLocation *time.Location) *MessageHandler {
+	return &MessageHandler{repo: repo, audioDir: audioDir, companyLocation: companyLocation}
 }
 
 type messageResponse struct {
@@ -102,7 +104,7 @@ func present(m *model.Message) messageResponse {
 
 func (h *MessageHandler) List() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		filter, err := parseFilter(r)
+		filter, err := parseFilter(r, h.companyLocation)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -152,16 +154,11 @@ func (h *MessageHandler) Audio() http.HandlerFunc {
 			return
 		}
 
-		// Range-запросы не считаем: одно прослушивание в потоковом плеере — это
-		// пачка догрузок хвоста, и счётчик показывал бы их, а не людей. Открытие
-		// записи — это всегда первый запрос, без Range.
-		if r.Header.Get("Range") == "" {
-			// Журнал не должен мешать работе: не записалась отметка — человек всё
-			// равно слушает обращение. Аудио тут продукт, учёт — бухгалтерия.
-			if err := h.repo.AddPlay(r.Context(), message.ID, userID, time.Now().UTC()); err != nil {
-				slog.Error("Не удалось записать отметку о прослушивании",
-					"message_id", message.ID, "user_id", userID, "error", err)
-			}
+		// Считаем и Range-запросы: иначе «Range: bytes=0-» отдаёт весь файл без
+		// следа в журнале. Догрузки хвоста схлопывает AddPlay (окно 60 с).
+		if err := h.repo.AddPlay(r.Context(), message.ID, userID, time.Now().UTC()); err != nil {
+			slog.Error("Не удалось записать отметку о прослушивании",
+				"message_id", message.ID, "user_id", userID, "error", err)
 		}
 
 		// no-store, а не max-age: с кэшем повторное открытие в пределах часа не
@@ -231,10 +228,7 @@ func (h *MessageHandler) requestUser(r *http.Request) (int64, bool) {
 	// Postman — заголовка не принесёт, и человек всё равно должен завестись.
 	name := displayName(r)
 	if name == "" {
-		name = strings.TrimSpace(r.Header.Get("X-User-Name"))
-		if len(name) > maxNameLen {
-			name = name[:maxNameLen]
-		}
+		name = normalizeName(r.Header.Get("X-User-Name"))
 	}
 
 	if err := h.repo.EnsureUser(r.Context(), userID, name, time.Now().UTC()); err != nil {
@@ -259,12 +253,24 @@ func displayName(r *http.Request) string {
 		return ""
 	}
 
-	decoded = strings.TrimSpace(decoded)
-	if len(decoded) > maxNameLen {
-		decoded = decoded[:maxNameLen]
-	}
+	return normalizeName(decoded)
+}
 
-	return decoded
+// normalizeName сохраняет предел в байтах, не разрезая символ UTF-8.
+// Некорректное имя не используем: оно косметическое, личность задаёт user_id.
+func normalizeName(name string) string {
+	name = strings.TrimSpace(name)
+	if !utf8.ValidString(name) {
+		return ""
+	}
+	if len(name) > maxNameLen {
+		end := maxNameLen
+		for !utf8.RuneStart(name[end]) {
+			end--
+		}
+		name = name[:end]
+	}
+	return name
 }
 
 type patchRequest struct {
@@ -311,10 +317,7 @@ func (h *MessageHandler) Patch() http.HandlerFunc {
 		// в справочник: тогда «v.petrov» превращается в человека разом везде,
 		// и в списке обращений, и в журналах прослушиваний за прошлые дни.
 		if body.UpdatedByName != nil {
-			if trimmed := strings.TrimSpace(*body.UpdatedByName); trimmed != "" {
-				if len(trimmed) > maxNameLen {
-					trimmed = trimmed[:maxNameLen]
-				}
+			if trimmed := normalizeName(*body.UpdatedByName); trimmed != "" {
 				if err := h.repo.SetUserName(r.Context(), userID, trimmed); err != nil {
 					slog.Error("Не удалось обновить имя пользователя",
 						"user_id", userID, "error", err)
@@ -411,7 +414,7 @@ func (h *MessageHandler) load(w http.ResponseWriter, r *http.Request) (*model.Me
 	return message, true
 }
 
-func parseFilter(r *http.Request) (repository.Filter, error) {
+func parseFilter(r *http.Request, location *time.Location) (repository.Filter, error) {
 	query := r.URL.Query()
 
 	filter := repository.Filter{
@@ -433,12 +436,12 @@ func parseFilter(r *http.Request) (repository.Filter, error) {
 
 	var err error
 	if raw := query.Get("dateFrom"); raw != "" {
-		if filter.From, err = parseDate(raw, false); err != nil {
+		if filter.From, err = parseDate(raw, false, location); err != nil {
 			return filter, errors.New("Некорректная дата в dateFrom")
 		}
 	}
 	if raw := query.Get("dateTo"); raw != "" {
-		if filter.To, err = parseDate(raw, true); err != nil {
+		if filter.To, err = parseDate(raw, true, location); err != nil {
 			return filter, errors.New("Некорректная дата в dateTo")
 		}
 	}
@@ -449,17 +452,17 @@ func parseFilter(r *http.Request) (repository.Filter, error) {
 // parseDate принимает и RFC3339, и просто дату из календаря на фронте.
 // Для верхней границы день расширяется до конца суток, иначе "по 24 августа"
 // отсекало бы всё, что пришло после полуночи.
-func parseDate(raw string, endOfDay bool) (time.Time, error) {
+func parseDate(raw string, endOfDay bool, location *time.Location) (time.Time, error) {
 	if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
 		return parsed.UTC(), nil
 	}
 
-	parsed, err := time.Parse("2006-01-02", raw)
+	parsed, err := time.ParseInLocation("2006-01-02", raw, location)
 	if err != nil {
 		return time.Time{}, err
 	}
 	if endOfDay {
-		parsed = parsed.Add(24*time.Hour - time.Second)
+		parsed = parsed.AddDate(0, 0, 1).Add(-time.Second)
 	}
 
 	return parsed.UTC(), nil

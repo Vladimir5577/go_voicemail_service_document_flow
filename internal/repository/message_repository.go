@@ -275,9 +275,14 @@ func (r *MessageRepository) SetUserName(ctx context.Context, id int64, name stri
 func (r *MessageRepository) AddPlay(ctx context.Context, messageID, userID int64, at time.Time) error {
 	const query = `
 		INSERT INTO message_plays (message_id, user_id, played_at)
-		VALUES (?, ?, ?)`
+		SELECT ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM message_plays
+			WHERE message_id = ? AND user_id = ? AND played_at > ?)`
 
-	_, err := r.db.ExecContext(ctx, query, messageID, userID, at.Unix())
+	_, err := r.db.ExecContext(ctx, query,
+		messageID, userID, at.Unix(),
+		messageID, userID, at.Unix()-60)
 	return err
 }
 

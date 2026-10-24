@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-// Setup инициализирует и устанавливает глобальный логгер slog
+// Setup: local/dev — текстовый лог уровня Debug, остальные окружения — JSON уровня Info.
 func Setup(env string) {
 	var handler slog.Handler
 

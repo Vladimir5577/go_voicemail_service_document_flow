@@ -16,8 +16,9 @@ import (
 )
 
 type Config struct {
-	Env  string
-	Port string
+	Env             string
+	Port            string
+	CompanyTimezone string
 
 	// DBPath — файл SQLite, AudioDir — корень для mp3.
 	DBPath   string
@@ -42,10 +43,11 @@ func Load() *Config {
 	}
 
 	c := &Config{
-		Env:      getEnv("ENV", "local"),
-		Port:     getEnv("SERVER_PORT", "8089"),
-		DBPath:   getEnv("DB_PATH", "./data/voicemail.db"),
-		AudioDir: getEnv("AUDIO_DIR", "./audio"),
+		Env:             getEnv("ENV", "local"),
+		Port:            getEnv("SERVER_PORT", "8089"),
+		CompanyTimezone: getEnv("COMPANY_TIMEZONE", "Europe/Moscow"),
+		DBPath:          getEnv("DB_PATH", "./data/voicemail.db"),
+		AudioDir:        getEnv("AUDIO_DIR", "./audio"),
 
 		VmapiURL:     getEnv("VMAPI_URL", ""),
 		VmapiToken:   getEnv("VMAPI_TOKEN", ""),

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/go-chi/chi/v5"
 
@@ -28,6 +29,15 @@ type App struct {
 }
 
 func NewApp(cfg *config.Config, db *sql.DB) (*App, error) {
+	companyTimezone := cfg.CompanyTimezone
+	if companyTimezone == "" {
+		companyTimezone = "Europe/Moscow"
+	}
+	companyLocation, err := time.LoadLocation(companyTimezone)
+	if err != nil {
+		return nil, fmt.Errorf("некорректный часовой пояс компании: %w", err)
+	}
+
 	if err := os.MkdirAll(cfg.AudioDir, 0o755); err != nil {
 		return nil, fmt.Errorf("не удалось создать каталог для записей: %w", err)
 	}
@@ -36,7 +46,7 @@ func NewApp(cfg *config.Config, db *sql.DB) (*App, error) {
 	client := vmapi.New(cfg.VmapiURL, cfg.VmapiToken, cfg.VmapiTimeout)
 
 	return &App{
-		router: setupRouter(handler.NewMessageHandler(repo, cfg.AudioDir)),
+		router: setupRouter(handler.NewMessageHandler(repo, cfg.AudioDir, companyLocation)),
 		cfg:    cfg,
 		sync:   service.NewSyncService(client, repo, cfg.AudioDir, cfg.VmapiLimit),
 	}, nil
