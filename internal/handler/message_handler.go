@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -231,10 +232,7 @@ func (h *MessageHandler) requestUser(r *http.Request) (int64, bool) {
 	// Postman — заголовка не принесёт, и человек всё равно должен завестись.
 	name := displayName(r)
 	if name == "" {
-		name = strings.TrimSpace(r.Header.Get("X-User-Name"))
-		if len(name) > maxNameLen {
-			name = name[:maxNameLen]
-		}
+		name = normalizeName(r.Header.Get("X-User-Name"))
 	}
 
 	if err := h.repo.EnsureUser(r.Context(), userID, name, time.Now().UTC()); err != nil {
@@ -259,12 +257,24 @@ func displayName(r *http.Request) string {
 		return ""
 	}
 
-	decoded = strings.TrimSpace(decoded)
-	if len(decoded) > maxNameLen {
-		decoded = decoded[:maxNameLen]
-	}
+	return normalizeName(decoded)
+}
 
-	return decoded
+// normalizeName сохраняет предел в байтах, не разрезая символ UTF-8.
+// Некорректное имя не используем: оно косметическое, личность задаёт user_id.
+func normalizeName(name string) string {
+	name = strings.TrimSpace(name)
+	if !utf8.ValidString(name) {
+		return ""
+	}
+	if len(name) > maxNameLen {
+		end := maxNameLen
+		for !utf8.RuneStart(name[end]) {
+			end--
+		}
+		name = name[:end]
+	}
+	return name
 }
 
 type patchRequest struct {
@@ -311,10 +321,7 @@ func (h *MessageHandler) Patch() http.HandlerFunc {
 		// в справочник: тогда «v.petrov» превращается в человека разом везде,
 		// и в списке обращений, и в журналах прослушиваний за прошлые дни.
 		if body.UpdatedByName != nil {
-			if trimmed := strings.TrimSpace(*body.UpdatedByName); trimmed != "" {
-				if len(trimmed) > maxNameLen {
-					trimmed = trimmed[:maxNameLen]
-				}
+			if trimmed := normalizeName(*body.UpdatedByName); trimmed != "" {
 				if err := h.repo.SetUserName(r.Context(), userID, trimmed); err != nil {
 					slog.Error("Не удалось обновить имя пользователя",
 						"user_id", userID, "error", err)
